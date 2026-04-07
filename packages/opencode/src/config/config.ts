@@ -1016,6 +1016,34 @@ export namespace Config {
             .describe("Token buffer for compaction. Leaves enough window to avoid overflow during compaction."),
         })
         .optional(),
+      domains: z
+        .record(
+          z.string(),
+          z.object({
+            description: z.string(),
+            prompt: z.string().optional().describe("Domain-specific system prompt section"),
+            tools: z.array(z.string()).optional().describe("Tool IDs available in this domain"),
+            mcps: z.array(z.string()).optional().describe("MCP server names available in this domain"),
+            skills: z.array(z.string()).optional().describe("Skill names available in this domain"),
+            keywords: z.array(z.string()).optional().describe("Keywords for fast domain matching"),
+            permission: Permission.optional().describe("Domain-specific permissions"),
+          }),
+        )
+        .optional()
+        .describe("Domain definitions for domain-centered agent specialization (DDAF)"),
+      memory: z
+        .object({
+          enabled: z.boolean().optional().describe("Enable semantic memory (default: true)"),
+          auto: z.boolean().optional().describe("Automatically memorize conversation summaries (default: true)"),
+          limit: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Max memory entries to inject into context per turn (default: 5)"),
+        })
+        .optional()
+        .describe("Memory configuration for domain-scoped semantic memory"),
       experimental: z
         .object({
           disable_paste_summary: z.boolean().optional(),

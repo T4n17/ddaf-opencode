@@ -50,6 +50,7 @@ import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Layer, Option, Scope, ServiceMap } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { makeRuntime } from "@/effect/run-service"
+import { DomainPrompt } from "../domain/prompt"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1498,18 +1499,77 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
                 yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-                const [skills, env, instructions, modelMsgs] = yield* Effect.all([
-                  Effect.promise(() => SystemPrompt.skills(agent)),
+                // DDAF: extract LAST user message for domain classification
+                const tail = msgs.findLast((m) => m.info.role === "user")
+                const query = (tail?.parts
+                  .filter((p) => p.type === "text" && !p.synthetic)
+                  .map((p) => "text" in p ? p.text : "")
+                  .join("\n") ?? "").slice(0, 500)
+
+                // DDAF: resolve domain-scoped context (classifier + memory + skills)
+                const resolved = yield* Effect.promise(() =>
+                  DomainPrompt.resolve({ query, agent }),
+                )
+
+                // DDAF: override agent.prompt with domain prompt so the huge
+                // provider prompt (anthropic.txt, beast.txt, etc.) is skipped in llm.ts.
+                // Every domain (including fallback) provides its own compact prompt.
+                const scoped = resolved.domain.prompt
+                  ? { ...agent, prompt: resolved.domain.prompt }
+                  : agent
+
+                const [env, allMsgs] = yield* Effect.all([
                   Effect.promise(() => SystemPrompt.environment(model)),
-                  instruction.system().pipe(Effect.orDie),
                   Effect.promise(() => MessageV2.toModelMessages(msgs, model)),
                 ])
-                const system = [...env, ...(skills ? [skills] : []), ...instructions]
+
+                // DDAF: keep only the current turn (from last user message onward).
+                // Previous context is preserved via memory summaries in the system prompt.
+                // This avoids stale tool_calls from a different domain leaking in.
+                let last = 0
+                for (let i = allMsgs.length - 1; i >= 0; i--) {
+                  if (allMsgs[i].role === "user") { last = i; break }
+                }
+                const trimmed = last > 0
+                const modelMsgs = trimmed ? allMsgs.slice(last) : allMsgs
+
+                // DDAF: domain system includes memories + scoped skills already
+                const system = [
+                  ...env,
+                  ...(trimmed
+                    ? ["<context>Earlier conversation was summarized in the memory blocks above. Only recent messages follow.</context>"]
+                    : []),
+                  ...resolved.system,
+                ]
                 const format = lastUser.format ?? { type: "text" as const }
                 if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+
+                // DDAF: internal tools that must always be available
+                const internal = new Set(["invalid", "question", "batch", "plan_exit"])
+
+                // DDAF: filter tools by domain whitelist
+                if (resolved.tools) {
+                  const allowed = new Set(resolved.tools)
+                  for (const key of Object.keys(tools)) {
+                    if (internal.has(key)) continue
+                    if (!allowed.has(key)) delete tools[key]
+                  }
+                }
+
+                // DDAF: filter MCP tools by domain mcp whitelist
+                if (resolved.mcps) {
+                  for (const key of Object.keys(tools)) {
+                    if (internal.has(key)) continue
+                    if (resolved.tools && new Set(resolved.tools).has(key)) continue
+                    if (!resolved.mcps.some((prefix) => key.startsWith(prefix))) {
+                      delete tools[key]
+                    }
+                  }
+                }
+
                 const result = yield* handle.process({
                   user: lastUser,
-                  agent,
+                  agent: scoped,
                   permission: session.permission,
                   sessionID,
                   parentSessionID: session.parentID,
@@ -1561,6 +1621,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+
+          // DDAF: auto-memorize conversation after loop completes
+          yield* Effect.promise(async () => {
+            const parts: string[] = []
+            for await (const item of MessageV2.stream(sessionID)) {
+              if (item.info.role !== "user" && item.info.role !== "assistant") continue
+              const txt = item.parts
+                .filter((p) => p.type === "text")
+                .map((p) => "text" in p ? p.text : "")
+                .join("\n")
+              if (txt) parts.push(`${item.info.role}: ${txt}`)
+            }
+            const text = parts.join("\n").slice(0, 1500)
+            if (text.length < 50) return
+            await DomainPrompt.memorize(text)
+          }).pipe(Effect.ignore, Effect.forkIn(scope))
+
           return yield* lastAssistant(sessionID)
         },
       )
