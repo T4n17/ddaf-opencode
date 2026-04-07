@@ -42,7 +42,7 @@ export namespace Classifier {
             generateText({
               model: lang,
               temperature: 0,
-              maxTokens: 20,
+              maxOutputTokens: 20,
               messages: [
                 {
                   role: "system",
